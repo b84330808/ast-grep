@@ -105,10 +105,10 @@ impl PrintProcessor<CloudOutput> for CloudProcessor {
         Ok(CloudOutput::GitHub(ret))
       }
       Platform::Sarif => {
-        let path = file.name();
+        let uri = path_to_uri(file.name());
         let results = matches
           .into_iter()
-          .map(|nm| create_sarif_result(&nm, path, rule))
+          .map(|nm| create_sarif_result(&nm, &uri, rule))
           .collect();
         Ok(CloudOutput::Sarif(results))
       }
@@ -137,12 +137,12 @@ impl PrintProcessor<CloudOutput> for CloudProcessor {
         Ok(CloudOutput::GitHub(ret))
       }
       Platform::Sarif => {
-        let path = path.to_string_lossy();
+        let uri = path_to_uri(&path.to_string_lossy());
         let results = diffs
           .into_iter()
           .map(|(diff, rule)| {
-            let ret = create_sarif_result(&diff.node_match, &path, rule);
-            attach_sarif_fix(ret, &path, diff)
+            let ret = create_sarif_result(&diff.node_match, &uri, rule);
+            attach_sarif_fix(ret, &uri, diff)
           })
           .collect();
         Ok(CloudOutput::Sarif(results))
@@ -186,9 +186,37 @@ fn severity_to_sarif_level(severity: &Severity) -> sarif::ResultLevel {
   }
 }
 
+/// SARIF `artifactLocation.uri` is a URI reference, not a file path.
+fn path_to_uri(path: &str) -> String {
+  let is_absolute = Path::new(path).is_absolute();
+  // `\` separates Windows paths but is an ordinary file name character elsewhere
+  let path = if cfg!(windows) {
+    Cow::Owned(path.replace('\\', "/"))
+  } else {
+    Cow::Borrowed(path)
+  };
+  let mut uri = String::with_capacity(path.len());
+  if is_absolute {
+    // file:///src/a.js, file:///C:/src/a.js and file://server/share/a.js
+    uri.push_str(match path.as_bytes() {
+      [b'/', b'/', ..] if cfg!(windows) => "file:",
+      [b'/', ..] => "file://",
+      _ => "file:///",
+    });
+  }
+  for byte in path.bytes() {
+    if byte.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@/".contains(&byte) {
+      uri.push(char::from(byte));
+    } else {
+      uri.push_str(&format!("%{byte:02X}"));
+    }
+  }
+  uri
+}
+
 fn create_sarif_result(
   node_match: &NodeMatch,
-  path: &str,
+  uri: &str,
   rule: &RuleConfig<SgLang>,
 ) -> sarif::Result {
   let message = rule.get_message(node_match);
@@ -212,11 +240,10 @@ fn create_sarif_result(
     )
     .build();
 
-  // TODO: path is not URI, this impl should handle path to uri
   let physical_location = sarif::PhysicalLocation::builder()
     .artifact_location(
       sarif::ArtifactLocation::builder()
-        .uri(path.to_string())
+        .uri(uri.to_string())
         .build(),
     )
     .region(region)
@@ -236,7 +263,7 @@ fn create_sarif_result(
   result
 }
 
-fn attach_sarif_fix(mut result: sarif::Result, path: &str, diff: Diff<'_>) -> sarif::Result {
+fn attach_sarif_fix(mut result: sarif::Result, uri: &str, diff: Diff<'_>) -> sarif::Result {
   let range = diff.range;
   // Add fix information if replacement is available
   let mut deleted_region = sarif::Region::builder()
@@ -269,7 +296,7 @@ fn attach_sarif_fix(mut result: sarif::Result, path: &str, diff: Diff<'_>) -> sa
 
   let artifact_change = sarif::ArtifactChange {
     artifact_location: sarif::ArtifactLocation::builder()
-      .uri(path.to_string())
+      .uri(uri.to_string())
       .build(),
     replacements: vec![replacement],
     properties: None,
@@ -398,6 +425,31 @@ rule: { pattern: console }
 severity: error
 ",
       "::error file=test.tsx,line=1,endLine=1,title=test::test rule\n",
+    );
+  }
+
+  #[test]
+  fn test_sarif_path_to_uri() {
+    assert_eq!(path_to_uri("src/test.ts"), "src/test.ts");
+    assert_eq!(path_to_uri("my dir/C#/100%.ts"), "my%20dir/C%23/100%25.ts");
+    assert_eq!(
+      path_to_uri("src/テスト.ts"),
+      "src/%E3%83%86%E3%82%B9%E3%83%88.ts"
+    );
+    #[cfg(unix)]
+    assert_eq!(path_to_uri("/src/test.ts"), "file:///src/test.ts");
+    #[cfg(unix)]
+    assert_eq!(path_to_uri(r"a\b.ts"), "a%5Cb.ts");
+  }
+
+  #[test]
+  #[cfg(windows)]
+  fn test_sarif_windows_path_to_uri() {
+    assert_eq!(path_to_uri(r"src\sub dir\test.ts"), "src/sub%20dir/test.ts");
+    assert_eq!(path_to_uri(r"C:\src\test.ts"), "file:///C:/src/test.ts");
+    assert_eq!(
+      path_to_uri(r"\\server\share\test.ts"),
+      "file://server/share/test.ts"
     );
   }
 

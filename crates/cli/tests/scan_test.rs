@@ -864,6 +864,34 @@ fix: let $VAR = $VAL
 }
 
 #[test]
+fn test_sg_scan_sarif_uri() -> Result<()> {
+  let rule = "
+id: use-let
+message: Use let instead of var
+severity: error
+language: JavaScript
+rule:
+  pattern: var $VAR = $VAL
+fix: let $VAR = $VAL
+";
+  let dir = create_test_files([("rule.yml", rule), ("my src/test.js", "var x = 123;")])?;
+  let output = Command::new(cargo_bin!())
+    .current_dir(dir.path())
+    .args(["scan", "-r", "rule.yml", "--format", "sarif"])
+    .assert()
+    .get_output()
+    .stdout
+    .clone();
+  let sarif: Value = from_slice(&output)?;
+  let result = &sarif["runs"][0]["results"][0];
+  let location = &result["locations"][0]["physicalLocation"]["artifactLocation"];
+  let change = &result["fixes"][0]["artifactChanges"][0]["artifactLocation"];
+  assert_eq!(location["uri"], "my%20src/test.js");
+  assert_eq!(change["uri"], "my%20src/test.js");
+  Ok(())
+}
+
+#[test]
 fn test_status_code_success_with_no_match() -> Result<()> {
   let dir = create_test_files([("rule.yml", RULE1)])?;
   Command::new(cargo_bin!())
